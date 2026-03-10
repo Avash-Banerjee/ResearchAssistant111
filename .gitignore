@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / dll files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDEs and other tools
+.vscode/
+.idea/
+*.swp
+*.bak
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Project-specific generated files
+data/chroma_db/
+logs/
+.streamlit/config.toml
