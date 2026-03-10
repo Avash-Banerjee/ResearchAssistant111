@@ -495,14 +495,31 @@ if run_trend:
                 st.exception(e)
 
 if st.session_state.trend_result:
-    trend = st.session_state.trend_result
-    mom = trend.get("momentum_scores", {})
+    trend  = st.session_state.trend_result
+    mom    = trend.get("momentum_scores", {})
+    method = trend.get("topic_method", "llm")
 
-    c1, c2, c3, c4 = st.columns(4)
+    # Method badge
+    method_colors = {
+        "bertopic": ("#10B981", "🧠 BERTopic"),
+        "lda":      ("#4F8EF7", "📊 LDA"),
+        "llm":      ("#8B5CF6", "🤖 LLM"),
+    }
+    mc, ml = method_colors.get(method, ("#6B7280", method.upper()))
+    st.markdown(
+        f'<div style="margin-bottom:12px;">'
+        f'<span style="background:{mc}22;color:{mc};border:1px solid {mc}44;'
+        f'padding:4px 12px;border-radius:20px;font-size:0.8rem;font-weight:700;">'
+        f'Topic Modeling: {ml}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     metric_card(c1, mom.get("momentum", "N/A"), "Momentum")
     metric_card(c2, mom.get("recent_papers_count", 0), "Recent (2022+)")
     metric_card(c3, mom.get("avg_citations", 0), "Avg Citations")
     metric_card(c4, f"{round(mom.get('recent_ratio',0)*100,1)}%", "Recent Ratio")
+    metric_card(c5, len(trend.get("topics", [])), "Topics Found")
 
     from utils.visualizations import make_keyword_bubble_chart, make_topic_sunburst
     col_k, col_t = st.columns(2)
@@ -517,14 +534,41 @@ if st.session_state.trend_result:
             use_container_width=True, key="trend_sunburst_chart",
         )
 
-    st.markdown("**🏷️ Topics**")
+    # Topics detail
+    st.markdown("**🏷️ Discovered Topics**")
     for i, topic in enumerate(trend.get("topics", [])):
-        with st.expander(f"Topic {i+1}: {topic.get('name','N/A')} — {topic.get('prevalence',0):.0f}%"):
+        emerging_tag = " 🔥 Emerging" if topic.get("is_emerging") else ""
+        label = (
+            f"Topic {i+1}: {topic.get('name','N/A')} — "
+            f"{topic.get('prevalence',0):.0f}%{emerging_tag} "
+            f"| {topic.get('paper_count',0)} papers | {topic.get('year_range','N/A')}"
+        )
+        with st.expander(label):
             st.markdown(topic.get("description", ""))
             st.markdown("**Keywords:** " + " · ".join([f"`{k}`" for k in topic.get("keywords", [])]))
+            if topic.get("avg_citations"):
+                st.markdown(f"**Avg Citations:** {topic.get('avg_citations',0)}")
+
+    # Keyword evolution table
+    evolution = trend.get("keyword_evolution", {})
+    if evolution:
+        with st.expander("📅 Keyword Evolution Across Time Windows"):
+            import pandas as pd
+            all_kws = set()
+            for window_data in evolution.values():
+                all_kws.update(list(window_data.keys())[:15])
+            rows = []
+            for kw in sorted(all_kws):
+                row = {"Keyword": kw}
+                for window, data in evolution.items():
+                    row[window] = data.get(kw, 0)
+                rows.append(row)
+            if rows:
+                df = pd.DataFrame(rows).sort_values("2023_plus", ascending=False).head(20)
+                st.dataframe(df, use_container_width=True)
 
     if trend.get("trend_report"):
-        with st.expander("📋 Full Trend Report"):
+        with st.expander("📋 Full RAG-Grounded Trend Report"):
             st.markdown(trend["trend_report"])
 
 st.markdown('</div>', unsafe_allow_html=True)
@@ -939,3 +983,107 @@ st.markdown("""
     Powered by <b>Gemini AI</b> · <b>ChromaDB</b> · <b>ArXiv</b> · <b>Semantic Scholar</b>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — RAG EXPLORER
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown('<div class="section-box">', unsafe_allow_html=True)
+section_header("🔭 8 · RAG Explorer — Ask Your Literature")
+
+# Stats bar
+try:
+    from core.vector_store import get_vector_store as _gvs
+    _vs = _gvs()
+    _stats = _vs.get_stats()
+    _c1, _c2 = st.columns(2)
+    metric_card(_c1, _stats.get("total_papers", 0), "Papers Indexed")
+    metric_card(_c2, _stats.get("total_chunks", 0), "RAG Chunks")
+    st.markdown("&nbsp;")
+except Exception:
+    pass
+
+st.markdown(
+    '<p style="color:#64748B;font-size:0.85rem;">Ask any question grounded in your indexed '
+    'literature. The system retrieves the most relevant paper chunks and generates a '
+    'cited answer.</p>',
+    unsafe_allow_html=True,
+)
+
+rag_query = st.text_area(
+    "Ask a question about your indexed papers",
+    placeholder=(
+        "e.g. What are the main efficiency bottlenecks in transformer architectures?\n"
+        "e.g. Which papers propose solutions for long-sequence attention?\n"
+        "e.g. What datasets are most commonly used in this field?"
+    ),
+    key="rag_query_input",
+    height=100,
+)
+
+_rc1, _rc2 = st.columns([1, 2])
+with _rc1:
+    n_rag_chunks = st.slider("Chunks to retrieve", 4, 16, 8, key="rag_n_chunks")
+    show_chunks  = st.checkbox("Show retrieved chunks", value=True, key="rag_show_chunks")
+with _rc2:
+    st.markdown("&nbsp;")
+    run_rag = st.button("🔭 Ask RAG", key="btn_rag", use_container_width=True)
+
+if run_rag:
+    if not check_api():
+        pass
+    elif not rag_query.strip():
+        st.warning("Enter a question above.")
+    else:
+        with st.spinner("🔭 Retrieving chunks and generating grounded answer..."):
+            try:
+                from core.vector_store import get_vector_store as _gvs2
+                from core.llm_client import get_llm as _gllm
+                _vs2    = _gvs2()
+                _chunks = _vs2.rag_retrieve_structured(rag_query, n_chunks=n_rag_chunks)
+                _ctx    = _vs2.rag_retrieve(rag_query, n_chunks=n_rag_chunks)
+
+                if not _ctx:
+                    st.warning("No indexed chunks found. Run Literature Mining first.")
+                else:
+                    if show_chunks:
+                        st.markdown("**📄 Retrieved Chunks**")
+                        for _i, _ch in enumerate(_chunks, 1):
+                            _rel = _ch.get("relevance", 0)
+                            _rc  = "#10B981" if _rel > 0.7 else "#F59E0B" if _rel > 0.5 else "#64748B"
+                            st.markdown(
+                                f'<div class="paper-card">'
+                                f'<div style="display:flex;justify-content:space-between;">'
+                                f'<b style="color:#93C5FD;">#{_i} {_ch.get("paper_title","")[:55]}</b>'
+                                f'<span style="color:{_rc};font-weight:700;font-size:0.78rem;">'
+                                f'relevance: {_rel:.2f}</span></div>'
+                                f'<div style="color:#475569;font-size:0.73rem;">📅 {_ch.get("year","")}</div>'
+                                f'<div style="color:#94A3B8;font-size:0.76rem;margin-top:5px;">'
+                                f'{_ch.get("text","")[:280]}...</div></div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    st.markdown("**🤖 RAG-Grounded Answer**")
+                    _llm2 = _gllm()
+                    _rag_prompt = f"""You are a research assistant. Answer the question using ONLY the provided paper excerpts.
+Cite papers by name and year when making claims. If context is insufficient, say so clearly.
+
+RETRIEVED PAPER EXCERPTS:
+{_ctx}
+
+QUESTION: {rag_query}
+
+Answer clearly using markdown. Cite specific papers to support each claim."""
+                    _answer = _llm2.generate(_rag_prompt, temperature=0.3)
+                    st.markdown(
+                        f'<div style="background:#0A1628;border:1px solid #1E3A5F;'
+                        f'border-radius:10px;padding:18px;margin-top:10px;">'
+                        f'{_answer}</div>',
+                        unsafe_allow_html=True,
+                    )
+            except Exception as _e:
+                st.error(f"RAG error: {_e}")
+                st.exception(_e)
+
+st.markdown('</div>', unsafe_allow_html=True)

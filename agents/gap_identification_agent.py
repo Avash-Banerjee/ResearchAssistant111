@@ -173,8 +173,16 @@ class GapIdentificationAgent:
     # ─── LLM Gap Identification ───────────────────────────────────────────────
 
     def _identify_gaps_via_llm(self, papers: List[Dict], query: str) -> List[Dict]:
-        """Use Gemini to identify specific research gaps. Tries structured format
-        first, falls back to JSON if parsing yields nothing."""
+        """Use Gemini to identify specific research gaps, grounded in RAG chunks.
+        Retrieves chunks specifically about limitations/challenges/future work
+        so the LLM sees what the papers themselves say is missing."""
+
+        # RAG: retrieve chunks about limitations and future directions
+        rag_context = self.vector_store.rag_retrieve(
+            query      = f"{query} limitations challenges future work open problems unsolved",
+            n_chunks   = 10,
+            max_per_paper = 2,
+        )
 
         paper_summaries = []
         for i, p in enumerate(papers[:20], 1):
@@ -184,10 +192,19 @@ class GapIdentificationAgent:
                 f"   {p.get('abstract', '')[:200]}..."
             )
 
+        rag_section = ""
+        if rag_context:
+            rag_section = f"""
+RETRIEVED PAPER EXCERPTS — what papers say is missing or unsolved:
+{rag_context}
+
+"""
+
         prompt = f"""You are analyzing research papers on "{query}" to identify RESEARCH GAPS.
 
 EXISTING RESEARCH ({len(papers)} papers analyzed):
 {chr(10).join(paper_summaries)}
+{rag_section}
 
 YOU MUST respond using EXACTLY this repeated block format. Output ONLY these structured blocks with no prose, no headers, no extra text before or after.
 

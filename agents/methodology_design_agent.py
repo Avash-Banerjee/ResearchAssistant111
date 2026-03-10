@@ -8,6 +8,7 @@ import logging
 import json
 from typing import List, Dict, Optional, Callable
 from core.llm_client import get_llm
+from core.vector_store import get_vector_store
 from config.settings import AGENT_CONFIGS
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,9 @@ class MethodologyDesignAgent:
     """
 
     def __init__(self):
-        self.llm = get_llm()
-        self.config = AGENT_CONFIGS["methodology_designer"]
+        self.llm          = get_llm()
+        self.vector_store = get_vector_store()
+        self.config       = AGENT_CONFIGS["methodology_designer"]
 
     # ─── Main Entry Point ─────────────────────────────────────────────────────
 
@@ -90,7 +92,16 @@ class MethodologyDesignAgent:
     def _generate_hypotheses(
         self, research_gap: str, domain: str, papers: List[Dict]
     ) -> List[Dict]:
-        """Generate testable hypotheses. Uses JSON output for reliability."""
+        """Generate testable hypotheses grounded in RAG-retrieved context."""
+
+        # RAG: what do papers in this domain actually claim, find, or leave unresolved?
+        rag_context = self.vector_store.rag_retrieve(
+            query    = f"{domain} {research_gap} hypothesis finding result conclusion",
+            n_chunks = 8, max_per_paper = 2,
+        )
+
+        rag_section = f"\nRELEVANT EXCERPTS FROM INDEXED PAPERS:\n{rag_context}\n" \
+                      if rag_context else ""
 
         context_papers = "\n".join([
             f"- {p.get('title', '')} ({p.get('year', '')})"
@@ -103,45 +114,21 @@ RESEARCH GAP: {research_gap}
 DOMAIN: {domain}
 RELATED WORK:
 {context_papers}
-
-Return ONLY a valid JSON array, no markdown, no code fences, no explanation:
+{rag_section}
+Return ONLY a valid JSON array, no markdown, no code fences:
 [
   {{
     "id": "H1",
-    "statement": "clear testable hypothesis statement",
+    "statement": "clear testable hypothesis statement grounded in the literature",
     "type": "Alternative",
-    "rationale": "why this hypothesis matters",
+    "rationale": "why this hypothesis matters — cite a paper from the excerpts",
     "test_approach": "how to test this hypothesis experimentally",
     "expected_outcome": "what result confirms or rejects it",
-    "novelty": "what makes this hypothesis novel"
+    "novelty": "what makes this hypothesis novel relative to existing work"
   }},
-  {{
-    "id": "H2",
-    "statement": "...",
-    "type": "Directional",
-    "rationale": "...",
-    "test_approach": "...",
-    "expected_outcome": "...",
-    "novelty": "..."
-  }},
-  {{
-    "id": "H3",
-    "statement": "...",
-    "type": "Null",
-    "rationale": "...",
-    "test_approach": "...",
-    "expected_outcome": "...",
-    "novelty": "..."
-  }},
-  {{
-    "id": "H4",
-    "statement": "...",
-    "type": "Alternative",
-    "rationale": "...",
-    "test_approach": "...",
-    "expected_outcome": "...",
-    "novelty": "..."
-  }}
+  {{"id":"H2","statement":"...","type":"Directional","rationale":"...","test_approach":"...","expected_outcome":"...","novelty":"..."}},
+  {{"id":"H3","statement":"...","type":"Null","rationale":"...","test_approach":"...","expected_outcome":"...","novelty":"..."}},
+  {{"id":"H4","statement":"...","type":"Alternative","rationale":"...","test_approach":"...","expected_outcome":"...","novelty":"..."}}
 ]"""
 
         response = self.llm.generate(prompt, system_prompt=None, temperature=0.3)
@@ -264,21 +251,19 @@ Be specific with numbers, tools, and techniques."""
     # ─── Datasets ─────────────────────────────────────────────────────────────
 
     def _recommend_datasets(self, domain: str, papers: List[Dict]) -> List[Dict]:
-        """Recommend datasets using JSON output."""
+        """Recommend datasets using RAG — retrieves chunks that actually mention datasets."""
 
-        # Collect dataset hints from abstracts
-        hints = []
-        for p in papers[:15]:
-            abstract = p.get("abstract", "").lower()
-            for kw in ["dataset", "benchmark", "corpus", "collection"]:
-                if kw in abstract:
-                    hints.append(p.get("title", "")[:80])
-                    break
+        # RAG: find chunks that mention datasets/benchmarks actually used in this field
+        rag_context = self.vector_store.rag_retrieve(
+            query    = f"{domain} dataset benchmark corpus evaluation data collection",
+            n_chunks = 8, max_per_paper = 2,
+        )
+
+        rag_section = f"\nRELEVANT EXCERPTS FROM INDEXED PAPERS (actual dataset mentions):\n{rag_context}\n" \
+                      if rag_context else ""
 
         prompt = f"""Recommend 6 appropriate datasets or benchmarks for research in: "{domain}"
-
-Hints from related papers: {str(hints[:5]) if hints else "none"}
-
+{rag_section}
 Return ONLY a valid JSON array, no markdown, no code fences:
 [
   {{
@@ -292,7 +277,7 @@ Return ONLY a valid JSON array, no markdown, no code fences:
     "citation": "key paper name if known"
   }}
 ]
-Include 6 items total."""
+Include 6 items total. Prioritise datasets mentioned in the paper excerpts above."""
 
         response = self.llm.generate(prompt, system_prompt=None, temperature=0.3)
         datasets = self._parse_json_list(response)
@@ -343,10 +328,18 @@ CITATION: [paper]
     # ─── Baselines ────────────────────────────────────────────────────────────
 
     def _identify_baselines(self, domain: str) -> List[Dict]:
-        """Identify baseline methods using JSON output."""
+        """Identify baselines using RAG — retrieves chunks mentioning comparison methods."""
+
+        rag_context = self.vector_store.rag_retrieve(
+            query    = f"{domain} baseline comparison method state of the art SOTA compared against",
+            n_chunks = 8, max_per_paper = 2,
+        )
+
+        rag_section = f"\nRELEVANT EXCERPTS (methods compared in these papers):\n{rag_context}\n" \
+                      if rag_context else ""
 
         prompt = f"""Identify 6 appropriate baseline methods for research in: "{domain}"
-
+{rag_section}
 Return ONLY a valid JSON array, no markdown, no code fences:
 [
   {{
@@ -358,7 +351,7 @@ Return ONLY a valid JSON array, no markdown, no code fences:
     "implementation": "GitHub URL or library name"
   }}
 ]
-Include 6 items total."""
+Include 6 items total. Prioritise methods actually mentioned in the paper excerpts above."""
 
         response = self.llm.generate(prompt, system_prompt=None, temperature=0.3)
         baselines = self._parse_json_list(response)

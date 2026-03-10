@@ -1,7 +1,12 @@
 """
-ResearchIQ - Literature Mining Agent
-======================================
-Crawls research repositories, builds embeddings, and structures literature bases.
+ResearchIQ - Literature Mining Agent (v2 - RAG Grounded)
+=========================================================
+Every LLM generation call is grounded in retrieved paper chunks from ChromaDB.
+No more Gemini hallucinating from training data — all claims come from indexed papers.
+
+RAG usage:
+  _generate_summary()     → retrieves chunks for "overview themes methodology"
+  _generate_section()     → sub-queries for each report section individually
 """
 
 import logging
@@ -13,27 +18,26 @@ from config.settings import AGENT_CONFIGS
 
 logger = logging.getLogger(__name__)
 
-
 SYSTEM_PROMPT = """You are a Senior Research Librarian and Literature Mining Expert.
-Your task is to analyze research papers and provide structured insights about the literature.
-Always respond with precise, academically rigorous analysis.
-Format your output using clear headings and bullet points where appropriate."""
+Analyse research papers and provide structured, evidence-grounded insights.
+Every claim you make must be traceable to a specific paper in the provided context.
+Use precise academic language and cite paper titles explicitly."""
 
 
 class LiteratureMiningAgent:
     """
-    Agent 1: Literature Mining
+    Agent 1: Literature Mining (RAG-grounded)
     - Crawls ArXiv and Semantic Scholar
-    - Builds vector embeddings with ChromaDB
-    - Summarizes literature landscapes
-    - Identifies key papers and authors
+    - Indexes papers + RAG chunks in ChromaDB
+    - Generates literature summary grounded in retrieved chunks
+    - Identifies key authors, venues, temporal distribution
     """
 
     def __init__(self):
-        self.llm = get_llm()
+        self.llm          = get_llm()
         self.vector_store = get_vector_store()
-        self.fetcher = PaperFetcher()
-        self.config = AGENT_CONFIGS["literature_miner"]
+        self.fetcher      = PaperFetcher()
+        self.config       = AGENT_CONFIGS["literature_miner"]
 
     def mine_literature(
         self,
@@ -42,111 +46,158 @@ class LiteratureMiningAgent:
         max_papers: int = 20,
         progress_callback: Optional[Callable] = None,
     ) -> Dict:
-        """
-        Main entry point: mine literature for a given research query.
-        Returns structured literature analysis.
-        """
+
         result = {
-            "query": query,
-            "papers": [],
-            "new_papers_indexed": 0,
-            "summary": "",
-            "key_authors": [],
-            "key_venues": [],
-            "temporal_distribution": {},
-            "agent": self.config["name"],
+            "query":                query,
+            "papers":               [],
+            "new_papers_indexed":   0,
+            "summary":              "",
+            "key_authors":          [],
+            "key_venues":           [],
+            "temporal_distribution":{},
+            "rag_chunks_indexed":   0,
+            "agent":                self.config["name"],
         }
 
-        # Step 1: Fetch papers
+        # ── Step 1: Fetch ─────────────────────────────────────────────────
         if progress_callback:
-            progress_callback("🔍 Fetching papers from repositories...")
+            progress_callback("🔍 Fetching papers from ArXiv and Semantic Scholar...")
 
         papers = self.fetcher.fetch(
             query=query,
             sources=list(sources),
-            max_per_source=max_papers // len(sources),
+            max_per_source=max_papers,
         )
         result["papers"] = papers
 
         if not papers:
-            result["summary"] = "No papers found for the given query. Try broadening your search terms."
+            result["summary"] = "No papers found. Try broadening your search terms."
             return result
 
-        # Step 2: Index in vector store
+        # ── Step 2: Index (papers + RAG chunks) ───────────────────────────
         if progress_callback:
-            progress_callback(f"📦 Indexing {len(papers)} papers in vector store...")
+            progress_callback(
+                f"📦 Indexing {len(papers)} papers + chunking for RAG..."
+            )
         result["new_papers_indexed"] = self.vector_store.add_papers(papers)
+        stats = self.vector_store.get_stats()
+        result["rag_chunks_indexed"] = stats.get("total_chunks", 0)
+        logger.info(
+            f"Indexed {result['new_papers_indexed']} new papers. "
+            f"Total chunks: {result['rag_chunks_indexed']}"
+        )
 
-        # Step 3: Extract metadata insights
-        result["key_authors"] = self._extract_key_authors(papers)
-        result["key_venues"] = self._extract_key_venues(papers)
-        result["temporal_distribution"] = self._temporal_distribution(papers)
+        # ── Step 3: Metadata ───────────────────────────────────────────────
+        result["key_authors"]          = self._extract_key_authors(papers)
+        result["key_venues"]           = self._extract_key_venues(papers)
+        result["temporal_distribution"]= self._temporal_distribution(papers)
 
-        # Step 4: Generate LLM summary
+        # ── Step 4: RAG-grounded summary ───────────────────────────────────
         if progress_callback:
-            progress_callback("🤖 Generating literature analysis...")
-        result["summary"] = self._generate_summary(query, papers)
+            progress_callback("🤖 Generating RAG-grounded literature analysis...")
+        result["summary"] = self._generate_rag_summary(query, papers)
 
         return result
 
-    def semantic_search(self, query: str, n_results: int = 10) -> List[Dict]:
-        """Search indexed literature semantically."""
-        return self.vector_store.semantic_search(query, n_results=n_results)
+    # ─── RAG-Grounded Summary ─────────────────────────────────────────────────
 
-    def _generate_summary(self, query: str, papers: List[Dict]) -> str:
-        """Generate a comprehensive literature summary using Gemini."""
-        paper_texts = []
-        for i, p in enumerate(papers[:15], 1):
-            paper_texts.append(
-                f"{i}. **{p['title']}** ({p.get('year', 'N/A')})\n"
-                f"   Authors: {', '.join(p.get('authors', [])[:3])}\n"
-                f"   Citations: {p.get('citations', 0)}\n"
-                f"   Abstract: {p.get('abstract', '')[:300]}..."
-            )
+    def _generate_rag_summary(self, query: str, papers: List[Dict]) -> str:
+        """
+        Generate literature summary fully grounded in retrieved paper chunks.
 
-        prompt = f"""Analyze the following {len(papers)} research papers on the topic: "{query}"
+        Runs 5 targeted sub-queries against the chunk collection so each
+        section of the summary has dedicated retrieved evidence.
+        """
 
-PAPERS:
-{chr(10).join(paper_texts)}
+        # Sub-queries → each maps to a report section
+        sub_queries = {
+            "overview":      f"{query} overview landscape introduction",
+            "themes":        f"{query} main themes research directions",
+            "methods":       f"{query} methodology techniques approaches algorithms",
+            "findings":      f"{query} key results findings contributions",
+            "limitations":   f"{query} limitations challenges future work open problems",
+        }
 
-Provide a comprehensive literature analysis including:
+        section_contexts: Dict[str, str] = {}
+        for section, sq in sub_queries.items():
+            ctx = self.vector_store.rag_retrieve(sq, n_chunks=5, max_per_paper=2)
+            section_contexts[section] = ctx or "(no relevant chunks retrieved)"
+
+        # Also build a quick paper list for the "recommended reading" section
+        top_papers = sorted(papers, key=lambda p: p.get("citations", 0), reverse=True)[:8]
+        top_list   = "\n".join(
+            f'- "{p.get("title","")}" ({p.get("year","")}) — {p.get("citations",0)} citations'
+            for p in top_papers
+        )
+
+        prompt = f"""Write a comprehensive Literature Analysis for the research domain: "{query}"
+
+You MUST ground every claim in the RETRIEVED CONTEXT sections below.
+Cite papers by title and year. Do not invent papers or facts not found in the context.
+
+═══════════════════════════════════════════════
+CONTEXT — OVERVIEW & LANDSCAPE:
+{section_contexts['overview']}
+
+CONTEXT — MAIN THEMES:
+{section_contexts['themes']}
+
+CONTEXT — METHODS & TECHNIQUES:
+{section_contexts['methods']}
+
+CONTEXT — KEY FINDINGS:
+{section_contexts['findings']}
+
+CONTEXT — LIMITATIONS & OPEN PROBLEMS:
+{section_contexts['limitations']}
+
+TOP CITED PAPERS (by citation count):
+{top_list}
+═══════════════════════════════════════════════
+
+Write the following sections using ONLY information from the retrieved context above:
 
 ## 1. Research Landscape Overview
-[Describe the overall state of research in this area]
+What is the general state of this field? What problems are being addressed?
 
 ## 2. Major Research Themes
-[List and describe the 3-5 main research themes found]
+Identify and describe 3–5 major themes. For each, cite specific papers.
 
-## 3. Key Contributions
-[Highlight the most impactful papers and what they contributed]
+## 3. Key Contributions & Milestones
+Which papers made the most significant contributions and what did they achieve?
 
-## 4. Research Evolution
-[How has this research area evolved over time?]
+## 4. Dominant Methodologies
+What techniques and approaches are most widely used? Cite papers that use them.
 
-## 5. Dominant Methodologies
-[What methods/approaches are most commonly used?]
+## 5. Research Consensus & Debates
+Where do papers agree? Where do they disagree or point to contradictions?
 
-## 6. Research Consensus & Debates
-[What do researchers agree on? Where are the debates?]
+## 6. Open Challenges
+What limitations and unsolved problems do papers themselves identify?
 
 ## 7. Recommended Starting Points
-[Which 3-5 papers should a new researcher read first and why?]
+Which 3–5 papers should a new researcher read first, and why?
 
-Be specific, cite paper titles, and maintain academic rigor."""
+Maintain academic rigour. Be specific. Cite paper titles throughout."""
 
-        return self.llm.generate(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.5)
+        return self.llm.generate(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4)
+
+    # ─── Metadata Extraction ──────────────────────────────────────────────────
+
+    def semantic_search(self, query: str, n_results: int = 10) -> List[Dict]:
+        return self.vector_store.semantic_search(query, n_results=n_results)
 
     def _extract_key_authors(self, papers: List[Dict]) -> List[Dict]:
-        """Extract most prolific/cited authors."""
-        author_stats = {}
+        author_stats: Dict[str, Dict] = {}
         for paper in papers:
             citations = paper.get("citations", 0)
             for author in paper.get("authors", [])[:5]:
+                if not author:
+                    continue
                 if author not in author_stats:
                     author_stats[author] = {"papers": 0, "total_citations": 0}
-                author_stats[author]["papers"] += 1
+                author_stats[author]["papers"]          += 1
                 author_stats[author]["total_citations"] += citations
-
         return sorted(
             [{"name": k, **v} for k, v in author_stats.items()],
             key=lambda x: x["total_citations"],
@@ -154,11 +205,10 @@ Be specific, cite paper titles, and maintain academic rigor."""
         )[:10]
 
     def _extract_key_venues(self, papers: List[Dict]) -> List[Dict]:
-        """Extract most common publication venues."""
-        venue_counts = {}
+        venue_counts: Dict[str, int] = {}
         for paper in papers:
-            venue = paper.get("venue", "Unknown")
-            if venue and venue != "Unknown":
+            venue = paper.get("venue", "")
+            if venue and venue.lower() not in ("", "unknown", "none"):
                 venue_counts[venue] = venue_counts.get(venue, 0) + 1
         return sorted(
             [{"venue": k, "count": v} for k, v in venue_counts.items()],
@@ -167,8 +217,7 @@ Be specific, cite paper titles, and maintain academic rigor."""
         )[:10]
 
     def _temporal_distribution(self, papers: List[Dict]) -> Dict:
-        """Count papers per year."""
-        dist = {}
+        dist: Dict[str, int] = {}
         for paper in papers:
             year = paper.get("year")
             if year:

@@ -1,10 +1,16 @@
 """
-ResearchIQ - Novelty Scoring Agent
-======================================
-Computes semantic novelty scores and detects similarity with prior work.
+ResearchIQ - Novelty Scoring Agent (v2 - RAG Grounded)
+========================================================
+Semantic similarity via ChromaDB PLUS chunk-level RAG so the LLM sees
+exactly what the similar papers say before judging novelty — not just titles.
+
+RAG usage:
+  _analyze_novelty_dimensions() → retrieves actual text from most similar papers
+  _generate_novelty_report()    → retrieves chunks for "differentiation" framing
 """
 
 import logging
+import json
 import numpy as np
 from typing import List, Dict, Optional, Callable
 from core.llm_client import get_llm
@@ -14,274 +20,291 @@ from config.settings import AGENT_CONFIGS
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a Research Novelty and Integrity Expert.
-You evaluate the originality of research proposals and papers against existing literature.
-You provide honest, detailed novelty assessments with clear justifications.
-Your scores are calibrated, consistent, and actionable."""
+Evaluate the originality of research proposals against existing literature.
+You have been given actual excerpts from related papers — use these to make
+calibrated, evidence-based assessments. Be honest and specific."""
 
 
 class NoveltyScoringAgent:
     """
-    Agent 6: Novelty & Plagiarism Scoring
-    - Semantic similarity against indexed papers
-    - Novelty score computation (0-100)
-    - Detailed similarity breakdown
-    - Improvement suggestions
+    Agent 6: Novelty & Plagiarism Scoring (RAG-grounded)
+    - Semantic similarity via whole-paper embeddings
+    - RAG chunk retrieval so LLM reads actual paper text, not just titles
+    - Multi-dimensional novelty breakdown
+    - JSON-parsed output for reliability
     """
 
     def __init__(self):
-        self.llm = get_llm()
+        self.llm          = get_llm()
         self.vector_store = get_vector_store()
-        self.config = AGENT_CONFIGS["novelty_scorer"]
+        self.config       = AGENT_CONFIGS["novelty_scorer"]
 
     def score_novelty(
         self,
-        title: str,
-        abstract: str,
+        title:       str,
+        abstract:    str,
         methodology: str = "",
         progress_callback: Optional[Callable] = None,
     ) -> Dict:
-        """Score the novelty of a research idea/proposal."""
 
         result = {
-            "title": title,
-            "novelty_score": 0.0,
-            "similarity_score": 0.0,
-            "similar_papers": [],
+            "title":              title,
+            "novelty_score":      0.0,
+            "similarity_score":   0.0,
+            "similar_papers":     [],
             "uniqueness_aspects": [],
-            "overlap_concerns": [],
-            "novelty_breakdown": {},
-            "recommendations": [],
-            "novelty_report": "",
-            "verdict": "",
-            "agent": self.config["name"],
+            "overlap_concerns":   [],
+            "novelty_breakdown":  {},
+            "recommendations":    [],
+            "novelty_report":     "",
+            "verdict":            "",
+            "agent":              self.config["name"],
         }
 
-        full_text = f"{title} {abstract} {methodology}"
+        full_text = f"{title} {abstract} {methodology}".strip()
 
+        # ── Step 1: Whole-paper similarity search ─────────────────────────
         if progress_callback:
             progress_callback("🔍 Searching for similar papers...")
 
-        # Find semantically similar papers
         similar_papers = self.vector_store.semantic_search(full_text, n_results=15)
         result["similar_papers"] = similar_papers
 
+        # ── Step 2: Similarity score ──────────────────────────────────────
         if progress_callback:
             progress_callback("📊 Computing similarity scores...")
 
-        # Compute similarity scores
         similarities = [p.get("similarity", 0) for p in similar_papers]
         if similarities:
-            max_similarity = max(similarities)
-            avg_similarity = np.mean(similarities[:5])  # Top 5
-            result["similarity_score"] = round(float(avg_similarity), 4)
-        else:
-            max_similarity = 0
-            result["similarity_score"] = 0.0
+            result["similarity_score"] = round(float(np.mean(similarities[:5])), 4)
+        base_novelty = max(0.0, 100.0 - result["similarity_score"] * 100)
 
-        # Compute novelty score (inverse of similarity + LLM adjustment)
-        base_novelty = max(0, 100 - (result["similarity_score"] * 100))
-
+        # ── Step 3: RAG chunk retrieval ───────────────────────────────────
         if progress_callback:
-            progress_callback("🤖 Analyzing novelty dimensions...")
+            progress_callback("📚 Retrieving relevant paper excerpts via RAG...")
+
+        # Query from the perspective of the proposed work
+        rag_context = self.vector_store.rag_retrieve(
+            query      = f"{title} {abstract[:300]}",
+            n_chunks   = 10,
+            max_per_paper = 2,
+        )
+
+        # ── Step 4: LLM novelty analysis grounded in RAG chunks ───────────
+        if progress_callback:
+            progress_callback("🤖 Analysing novelty dimensions with RAG context...")
 
         llm_analysis = self._analyze_novelty_dimensions(
-            title, abstract, methodology, similar_papers[:8]
+            title, abstract, methodology,
+            similar_papers[:6], rag_context,
         )
-        result["novelty_breakdown"] = llm_analysis.get("breakdown", {})
+        result["novelty_breakdown"]  = llm_analysis.get("breakdown", {})
         result["uniqueness_aspects"] = llm_analysis.get("unique_aspects", [])
-        result["overlap_concerns"] = llm_analysis.get("overlap_concerns", [])
-        result["recommendations"] = llm_analysis.get("recommendations", [])
+        result["overlap_concerns"]   = llm_analysis.get("overlap_concerns", [])
+        result["recommendations"]    = llm_analysis.get("recommendations", [])
 
-        # Weighted final score
         llm_score = llm_analysis.get("llm_novelty_score", base_novelty)
-        result["novelty_score"] = round(
-            0.4 * base_novelty + 0.6 * llm_score, 2
-        )
+        result["novelty_score"] = round(0.4 * base_novelty + 0.6 * llm_score, 2)
+        result["verdict"]       = self._get_verdict(result["novelty_score"])
 
-        result["verdict"] = self._get_verdict(result["novelty_score"])
-
+        # ── Step 5: RAG-grounded report ───────────────────────────────────
         if progress_callback:
             progress_callback("📝 Generating novelty report...")
-        result["novelty_report"] = self._generate_novelty_report(result)
+        result["novelty_report"] = self._generate_novelty_report(result, rag_context)
 
         return result
+
+    # ─── RAG-Grounded Novelty Analysis ───────────────────────────────────────
 
     def _analyze_novelty_dimensions(
         self,
-        title: str,
-        abstract: str,
-        methodology: str,
+        title:         str,
+        abstract:      str,
+        methodology:   str,
         similar_papers: List[Dict],
+        rag_context:   str,
     ) -> Dict:
-        """Use LLM to analyze novelty across multiple dimensions."""
-        similar_texts = "\n".join([
-            f"[{i+1}] {p.get('title', '')} ({p.get('year', '')}) - Similarity: {p.get('similarity', 0):.2%}\n"
-            f"    {p.get('abstract', '')[:150]}..."
-            for i, p in enumerate(similar_papers[:6])
+        """
+        LLM novelty scoring grounded in actual retrieved paper text.
+        Uses JSON output for reliable parsing.
+        """
+        similar_summary = "\n".join([
+            f'[{i+1}] "{p.get("title","")} ({p.get("year","")}) '
+            f'— similarity: {p.get("similarity",0):.1%}"'
+            for i, p in enumerate(similar_papers)
         ])
 
-        prompt = f"""Analyze the novelty of this research:
+        prompt = f"""Assess the novelty of the proposed research using the retrieved literature excerpts.
 
+═══════════════════════════════════════════════
 PROPOSED RESEARCH:
-Title: {title}
-Abstract: {abstract}
+Title:       {title}
+Abstract:    {abstract[:600]}
 Methodology: {methodology[:400] if methodology else "Not specified"}
 
-MOST SIMILAR EXISTING PAPERS:
-{similar_texts if similar_texts else "No similar papers found in database."}
+SEMANTICALLY SIMILAR PAPERS (by embedding distance):
+{similar_summary or "None found."}
 
-Provide novelty analysis in this EXACT format:
+RETRIEVED LITERATURE EXCERPTS (actual paper text — use this as evidence):
+{rag_context or "No chunks available — base assessment on similar paper titles only."}
+═══════════════════════════════════════════════
 
-LLM_NOVELTY_SCORE: [0-100 integer]
+Based on the evidence above, return ONLY valid JSON with no markdown or code fences:
+{{
+  "llm_novelty_score": 72,
+  "breakdown": {{
+    "Problem Novelty":      {{"score": 8, "explanation": "..."}},
+    "Method Novelty":       {{"score": 7, "explanation": "..."}},
+    "Application Novelty":  {{"score": 6, "explanation": "..."}},
+    "Combination Novelty":  {{"score": 7, "explanation": "..."}}
+  }},
+  "unique_aspects": [
+    "Specific unique aspect 1 grounded in literature comparison",
+    "Specific unique aspect 2",
+    "Specific unique aspect 3"
+  ],
+  "overlap_concerns": [
+    "Specific overlap concern 1 citing a retrieved paper",
+    "Specific overlap concern 2"
+  ],
+  "recommendations": [
+    "Specific actionable recommendation 1",
+    "Specific actionable recommendation 2",
+    "Specific actionable recommendation 3"
+  ]
+}}
 
-BREAKDOWN:
-- Problem Novelty: [1-10] - [explanation]
-- Method Novelty: [1-10] - [explanation]
-- Application Novelty: [1-10] - [explanation]
-- Combination Novelty: [1-10] - [explanation]
+Score calibration: 85+ = highly novel, 70–84 = good, 55–69 = moderate, 40–54 = low, <40 = very low.
+Base your score on the actual excerpts — if the retrieved text shows the idea already exists, score lower."""
 
-UNIQUE_ASPECTS:
-- [Aspect 1: What makes this genuinely novel]
-- [Aspect 2]
-- [Aspect 3]
+        response = self.llm.generate(prompt, system_prompt=None, temperature=0.3)
+        return self._parse_json_analysis(response)
 
-OVERLAP_CONCERNS:
-- [Concern 1: Area of overlap with existing work]
-- [Concern 2]
-
-RECOMMENDATIONS:
-- [Recommendation 1: How to strengthen novelty]
-- [Recommendation 2]
-- [Recommendation 3]
-
-Be honest and calibrated. A score >80 means highly novel. 60-80 = good novelty. 40-60 = moderate. <40 = significant overlap."""
-
-        response = self.llm.generate(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4)
-        return self._parse_novelty_analysis(response)
-
-    def _parse_novelty_analysis(self, text: str) -> Dict:
-        """Parse LLM novelty analysis."""
-        result = {
+    @staticmethod
+    def _parse_json_analysis(response: str) -> Dict:
+        """Parse JSON novelty analysis with fallback defaults."""
+        defaults = {
             "llm_novelty_score": 70.0,
-            "breakdown": {},
-            "unique_aspects": [],
-            "overlap_concerns": [],
-            "recommendations": [],
+            "breakdown":         {},
+            "unique_aspects":    [],
+            "overlap_concerns":  [],
+            "recommendations":   [],
         }
+        try:
+            clean = response.strip().replace("```json", "").replace("```", "")
+            start = clean.find("{")
+            end   = clean.rfind("}")
+            if start == -1 or end == -1:
+                return defaults
+            data = json.loads(clean[start:end + 1])
 
-        lines = text.split("\n")
-        current_section = None
+            # Normalise types
+            data["llm_novelty_score"] = float(data.get("llm_novelty_score", 70))
 
-        for line in lines:
-            line = line.strip()
+            # Ensure breakdown values are dicts with score + explanation
+            bd = data.get("breakdown", {})
+            for k, v in bd.items():
+                if isinstance(v, (int, float)):
+                    bd[k] = {"score": float(v), "explanation": ""}
+                elif isinstance(v, dict):
+                    bd[k] = {
+                        "score":       float(v.get("score", 7)),
+                        "explanation": str(v.get("explanation", "")),
+                    }
+            data["breakdown"] = bd
 
-            if line.startswith("LLM_NOVELTY_SCORE:"):
-                try:
-                    score_text = line.replace("LLM_NOVELTY_SCORE:", "").strip()
-                    result["llm_novelty_score"] = float(score_text.split()[0])
-                except:
-                    pass
+            for key in ("unique_aspects", "overlap_concerns", "recommendations"):
+                data[key] = [str(x) for x in data.get(key, []) if x]
 
-            elif line.startswith("BREAKDOWN:"):
-                current_section = "breakdown"
-            elif line.startswith("UNIQUE_ASPECTS:"):
-                current_section = "unique"
-            elif line.startswith("OVERLAP_CONCERNS:"):
-                current_section = "overlap"
-            elif line.startswith("RECOMMENDATIONS:"):
-                current_section = "recs"
+            return {**defaults, **data}
+        except Exception as e:
+            logger.warning(f"Novelty JSON parse failed: {e} — using defaults")
+            return defaults
 
-            elif line.startswith("- ") and current_section:
-                content = line[2:].strip()
-                if current_section == "breakdown" and ":" in content:
-                    parts = content.split(":", 1)
-                    dim_name = parts[0].strip()
-                    rest = parts[1].strip() if len(parts) > 1 else ""
-                    # Try to extract score
-                    score_parts = rest.split("-", 1)
-                    try:
-                        score = float(score_parts[0].strip().split()[0])
-                    except:
-                        score = 7.0
-                    explanation = score_parts[1].strip() if len(score_parts) > 1 else ""
-                    result["breakdown"][dim_name] = {"score": score, "explanation": explanation}
-                elif current_section == "unique" and content:
-                    result["unique_aspects"].append(content)
-                elif current_section == "overlap" and content:
-                    result["overlap_concerns"].append(content)
-                elif current_section == "recs" and content:
-                    result["recommendations"].append(content)
+    # ─── RAG-Grounded Report ──────────────────────────────────────────────────
 
-        return result
+    def _generate_novelty_report(self, result: Dict, rag_context: str) -> str:
+        """Full novelty report grounded in RAG-retrieved literature."""
 
-    def _get_verdict(self, score: float) -> str:
-        """Get human-readable verdict for novelty score."""
-        if score >= 85:
-            return "🏆 Highly Novel - Strong candidate for top-tier venues"
-        elif score >= 70:
-            return "✅ Good Novelty - Suitable for competitive venues with strong positioning"
-        elif score >= 55:
-            return "⚠️ Moderate Novelty - Needs clearer differentiation from prior work"
-        elif score >= 40:
-            return "🔴 Low Novelty - Significant overlap detected, major revision needed"
-        else:
-            return "❌ Very Low Novelty - Substantial rethinking required"
+        breakdown_text = "\n".join([
+            f"- {dim}: {d.get('score',0)}/10 — {d.get('explanation','')}"
+            for dim, d in result["novelty_breakdown"].items()
+        ]) or "No breakdown available."
 
-    def _generate_novelty_report(self, result: Dict) -> str:
-        """Generate comprehensive novelty report."""
-        prompt = f"""Write a comprehensive novelty assessment report for:
+        prompt = f"""Write a comprehensive Novelty Assessment Report.
 
-TITLE: {result['title']}
-NOVELTY SCORE: {result['novelty_score']}/100
-VERDICT: {result['verdict']}
-SIMILARITY TO EXISTING WORK: {result['similarity_score']*100:.1f}%
+═══════════════════════════════════════════════
+RETRIEVED LITERATURE CONTEXT (use as evidence):
+{rag_context or "No chunks available."}
+═══════════════════════════════════════════════
 
-SIMILAR PAPERS FOUND: {len(result['similar_papers'])}
-Top similar paper: {result['similar_papers'][0].get('title', 'N/A') if result['similar_papers'] else 'None'}
+RESEARCH BEING ASSESSED:
+Title:          {result['title']}
+Novelty Score:  {result['novelty_score']}/100
+Verdict:        {result['verdict']}
+Similarity:     {result['similarity_score']*100:.1f}% to prior work
 
-UNIQUE ASPECTS: {', '.join(result['uniqueness_aspects'][:3])}
-OVERLAP CONCERNS: {', '.join(result['overlap_concerns'][:2])}
+DIMENSION SCORES:
+{breakdown_text}
 
-Write a detailed novelty assessment report:
+UNIQUE ASPECTS:    {chr(10).join('• '+u for u in result['uniqueness_aspects'])}
+OVERLAP CONCERNS:  {chr(10).join('• '+c for c in result['overlap_concerns'])}
+RECOMMENDATIONS:   {chr(10).join('→ '+r for r in result['recommendations'])}
+
+Write a detailed markdown report with these sections:
 
 ## Novelty Assessment Report
 
 ### Overall Verdict
-[Detailed explanation of the score and verdict]
+Explain the score and what it means for publication potential. Cite retrieved papers.
 
 ### Novelty Strengths
-[What makes this work novel and valuable?]
+What makes this work genuinely novel relative to the retrieved literature?
 
 ### Areas of Overlap
-[Where does this work overlap with prior art? Is this acceptable?]
+Where does this work overlap with existing papers? Quote specific retrieved excerpts.
 
 ### Differentiation Strategy
-[How should the researcher position this work?]
+How should the researcher position this work to maximise perceived novelty?
 
-### Recommendations for Strengthening Novelty
-[Specific, actionable recommendations]
+### Recommendations
+Specific, actionable steps to strengthen novelty, grounded in the literature gaps.
 
-### Publication Venue Recommendations
-[Which venues would be appropriate given this novelty level?]
+### Publication Venue Suggestions
+Which venues suit this novelty level? Give specific conference/journal names.
 
-Be constructive, honest, and specific."""
+Ground every claim in the retrieved context. Be honest and constructive."""
 
-        return self.llm.generate(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.5)
+        return self.llm.generate(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4)
+
+    # ─── Utilities ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_verdict(score: float) -> str:
+        if score >= 85:
+            return "🏆 Highly Novel — Strong candidate for top-tier venues"
+        elif score >= 70:
+            return "✅ Good Novelty — Suitable for competitive venues with strong positioning"
+        elif score >= 55:
+            return "⚠️ Moderate Novelty — Needs clearer differentiation from prior work"
+        elif score >= 40:
+            return "🔴 Low Novelty — Significant overlap detected, major revision needed"
+        else:
+            return "❌ Very Low Novelty — Substantial rethinking required"
 
     def batch_score(self, proposals: List[Dict]) -> List[Dict]:
-        """Score multiple proposals and return ranked results."""
         scored = []
         for proposal in proposals:
-            score_result = self.score_novelty(
+            r = self.score_novelty(
                 title=proposal.get("title", ""),
                 abstract=proposal.get("abstract", ""),
                 methodology=proposal.get("methodology", ""),
             )
             scored.append({
-                "title": proposal.get("title", ""),
-                "novelty_score": score_result["novelty_score"],
-                "verdict": score_result["verdict"],
-                "top_similar": score_result["similar_papers"][0].get("title", "N/A")
-                if score_result["similar_papers"] else "None",
+                "title":        proposal.get("title", ""),
+                "novelty_score":r["novelty_score"],
+                "verdict":      r["verdict"],
+                "top_similar":  r["similar_papers"][0].get("title", "N/A")
+                                if r["similar_papers"] else "None",
             })
         return sorted(scored, key=lambda x: x["novelty_score"], reverse=True)
