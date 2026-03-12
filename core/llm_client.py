@@ -5,11 +5,16 @@ Unified LLM interface using Google Gemini API (google-genai SDK).
 """
 
 import logging
+import time
 from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 from config.settings import GEMINI_API_KEY, GEMINI_MODEL
 
 logger = logging.getLogger(__name__)
+
+# Free-tier rate limit: ~15 RPM → space calls ~5s apart to stay safe
+_MIN_CALL_INTERVAL = 5.0
+_last_call_time = 0.0
 
 
 class GeminiClient:
@@ -50,7 +55,7 @@ class GeminiClient:
 
         self._initialized = True
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=60))
     def generate(
         self,
         prompt: str,
@@ -58,8 +63,17 @@ class GeminiClient:
         temperature: float = 0.7,
         max_tokens: int = 4096,
     ) -> str:
-        """Generate a response from Gemini."""
+        """Generate a response from Gemini with rate-limit throttling."""
+        global _last_call_time
         try:
+            # Throttle: wait between calls to respect free-tier RPM limit
+            elapsed = time.time() - _last_call_time
+            if elapsed < _MIN_CALL_INTERVAL:
+                wait = _MIN_CALL_INTERVAL - elapsed
+                logger.debug(f"Rate-limit throttle: waiting {wait:.1f}s")
+                time.sleep(wait)
+            _last_call_time = time.time()
+
             full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
             if self._sdk == "new":
@@ -88,7 +102,13 @@ class GeminiClient:
             raise
 
     def stream_generate(self, prompt: str, system_prompt: Optional[str] = None):
-        """Stream response from Gemini (generator)."""
+        """Stream response from Gemini (generator) with rate-limit throttling."""
+        global _last_call_time
+        elapsed = time.time() - _last_call_time
+        if elapsed < _MIN_CALL_INTERVAL:
+            time.sleep(_MIN_CALL_INTERVAL - elapsed)
+        _last_call_time = time.time()
+
         full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
         if self._sdk == "new":

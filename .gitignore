@@ -1,29 +1,39 @@
-# Byte-compiled / optimized / dll files
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyd
 *.pyo
 *.egg-info/
 .eggs/
+dist/
+build/
 
-# Environments
+# ── Environment & Secrets (NEVER commit .env) ────────────────────────────────
 .env
-.venv
+.venv/
 env/
 venv/
 
-# IDEs and other tools
+# ── IDEs ──────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
-*.bak
 *.swo
+*.bak
 
-# OS generated files
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Project-specific generated files
+# ── Project generated files ──────────────────────────────────────────────────
 data/chroma_db/
+data/exports/
 logs/
 .streamlit/config.toml
+
+# ── Backups (local dev only) ─────────────────────────────────────────────────
+backup_gemini/
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+.claude/
